@@ -1,0 +1,96 @@
+wavelink는 async로 실행시켜야함
+
+Lavalink WebSocket 연결
+
+Lavalink에서 음성 채널 입장은 PLayer로 한다.
+discord.py의 VoiceClient를 쓰는 것이 아니라
+wavelink.Player 사용
+Player는 음성 채널에 연결된 Lavalink 세션
+
+봇에서 연결 테스트를 위해
+
+# 쿼리 테스트
+@bot.command()
+async def load(ctx, *, query: str):
+    player: wavelink.Player = ctx.guild.voice_client
+
+    if not player:
+        await ctx.send("먼저 !join 으로 음성 채널에 들어와 주세요.")
+        return
+
+    tracks = await wavelink.Playable.search(query, source="ytsearch")
+
+    if not tracks:
+        await ctx.send("트랙을 찾지 못했습니다.")
+        return
+
+    track = tracks[0]
+    await ctx.send(f"✅ 트랙 로드 성공: {track.title}")
+
+아래 명령어를 수행했으나 lavalink에서 YouTube가 막혀있어서 트랙을 못가져옴
+-> Youtube 플러그인 붙이기
+
+youtube-plugin.jar
+
+https://github.com/lavalink-devs/youtube-source/releases
+-> youtube-plugin-1.16.0.jar
+
+아래 디렉토리에 생성
+lavalink/
+ ├─ Lavalink.jar
+ ├─ application.yml
+ └─ plugins/
+     └─ youtube-plugin.jar
+
+
+java -jar Lavalink.jar 로 실행시켜야함
+application.yml에 youtube : false 해야하는 이유
+기본 Youtube 소스를 완전히 끄는 것(옛날 디스코드 뮤직봇 시절에 쓴 legacy 코드)
+
+youtube-plugin은 lavaplayer를 우회하는 새로운 코드 구현
+
+기본 Youtube 소스 차단 youtube-plugin으로 대체
+
+application.yml 수정
+server:
+  port: 2333
+
+lavalink:
+  plugins:
+    load: true
+
+  server:
+    password: "youshallnotpass"
+    sources:
+      youtube: false
+      http: true
+      local: false
+
+plugins:
+  youtube:
+    clients:
+      - WEB
+      - ANDROID
+
+logging:
+  level:
+    root: INFO
+
+
+내가 적은 걸 도중에 끊어서 보지말고 처음부터 끝까지 다 읽고 이해해야해
+내가 생각하는건 디스코드 봇 서버 + 음원재생 서버 2개가 있으면 어떻게 되는지가 궁금해
+
+가장 처음에 시도한건 디스코드 봇 서버 하나에서 봇 제어+음원재생 둘 다 햇엇고
+여기선 Windows 환경에서는 음원재생 중 음원을 추가하면 재생 중이던 음원이 끊겼다가 재생됫고 WSL 환경에서는 음원재생 중 음원을 추가할 때 음원이 끊기는 문제는 없었지만 음원재생 자체가 불안정했어
+그래서 너는 환경문제라고 햇고 lavalink를 알려줬고 서버를 2개로 나누자고 햇엇어
+디스코드 봇 서버 1개와 lavalink서버 한개 이렇게 나누자고 햇엇는데
+lavalink가 문제였잖아
+근데 그냥 lavalink 안쓰고 파이썬 코드로 FFmpeg + Ytdlp로 음원만 재생하는 서버를 하나 만들자는거지
+
+그러면 디스코드 봇 서버 + 음원재생 서버(FFmpeg + ytdlp) 이렇게 되잖아
+이럴경우 서버 한개로 돌리는 것과 차이가 있는지
+정확히는 음원 끊기는 문제가 해결될 수 있는지
+아니면 서버 한개로 돌리는 것과 똑같은 효과고 여전히 음원이 끊김 문제가 있을 것인지 알려달라고
+
+별의별 지랄을 다해본결과
+그냥 코드로직 수정으로 해결

@@ -4,6 +4,7 @@ __pycache__/
 
 # Virtual Env
 venv/
+venv_wsl/
 
 # Environment variables
 .env

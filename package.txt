@@ -2,3 +2,17 @@ pip install discord.py
 pip install python-dotenv
 pip install PyNaCl
 pip install yt-dlp
+
+봇 권한 부여
+General Permissions
+View Channels
+
+Text Permissions
+Send Messages
+Read Message History
+Manage Messages
+
+Voice Permissions
+Connect
+Speak
+Use Voice Activity
