@@ -11,3 +11,6 @@ venv_wsl/
 
 # SSH key
 key/
+
+# lavalink application.yml
+application.yml
