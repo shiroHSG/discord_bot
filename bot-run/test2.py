@@ -3,8 +3,8 @@ from dotenv import load_dotenv
 import discord
 from discord.ext import commands, tasks
 import asyncio
-from yt_dlp import YoutubeDL
 import json
+import wavelink
 
 # =========================
 # 
@@ -45,12 +45,26 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.voice_states = True
 
-# ✅ 기본 help 제거
-bot = commands.Bot(
+# =========================
+# Bot
+# =========================
+class MyBot(commands.Bot):
+    async def setup_hook(self):
+        await wavelink.Pool.connect(
+            client=self,
+            nodes=[
+                wavelink.Node(
+                    uri="http://127.0.0.1:2333",
+                    password="youshallnotpass"
+                )
+            ]
+        )
+
+bot = MyBot(
     command_prefix="!",
     intents=intents,
     help_command=None
-    )
+)
 
 # =========================
 # Bot Status Task
@@ -65,65 +79,24 @@ async def update_server_count():
     )
 
 # =========================
-# yt-dlp / ffmpeg
-# =========================
-ytdl_opts = {
-    "format": "bestaudio/best",
-    "quiet": True,
-    "default_search": "ytsearch1",
-    "source_address": "0.0.0.0",
-    "noplaylist": True,
-}
-
-ffmpeg_opts = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
-}
-
-ytdl = YoutubeDL(ytdl_opts)
-
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.08):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get("title")
-        self.duration = data.get("duration")
-        self.url = data.get("webpage_url")
-        self.thumbnail = data.get("thumbnail")
-
-    @classmethod
-    async def from_query(cls, query, *, loop):
-
-        data = await loop.run_in_executor(
-            None, lambda: ytdl.extract_info(query, download=False)
-        )
-
-        if "entries" in data:
-            data = data["entries"][0]
-
-        source = discord.FFmpegPCMAudio(data["url"], **ffmpeg_opts)
-        return cls(source, data=data)
-
-# =========================
 # Button Control
 # =========================
 class PlayerControls(discord.ui.View):
-    def __init__(self, vc):
+    def __init__(self, player: wavelink.Player):
         super().__init__(timeout=None)
-        self.vc = vc
+        self.player = player
 
     @discord.ui.button(label="⏯", style=discord.ButtonStyle.primary)
     async def pause_resume(self, interaction, button):
-        if self.vc.is_playing():
-            self.vc.pause()
-        elif self.vc.is_paused():
-            self.vc.resume()
+        if self.player.playing:
+            await self.player.pause()
+        else:
+            await self.player.resume()
         await interaction.response.defer()
 
     @discord.ui.button(label="⏭", style=discord.ButtonStyle.secondary)
     async def skip(self, interaction, button):
-        if self.vc.is_playing() or self.vc.is_paused():
-            self.vc.stop()
+        await self.player.stop()
         await interaction.response.defer()
 
 # =========================
@@ -154,17 +127,17 @@ class Music(commands.Cog):
     # =========================
     # Embed Builder
     # =========================
-    def build_now_playing_embed(self, source, requester):
+    def build_now_playing_embed(self, track: wavelink.Playable, requester):
         embed = discord.Embed(
             title="🎶 지금 재생중",
-            description=f"[{source.title}]({source.url})",
+            description=f"[{track.title}]({track.uri})",
             color=0x1DB954
         )
 
-        if source.thumbnail:
-            embed.set_thumbnail(url=source.thumbnail)
+        if track.artwork:
+            embed.set_thumbnail(url=track.artwork)
 
-        m, s = divmod(source.duration or 0, 60)
+        m, s = divmod((track.length or 0) // 1000, 60)
         embed.add_field(
             name="곡 길이",
             value=f"{m:02}:{s:02}",
@@ -190,16 +163,6 @@ class Music(commands.Cog):
                 pass
 
     # =========================
-    # Safe Play
-    # =========================
-    def safe_play(self, vc, source):
-        try:
-            vc.play(source)
-            return True
-        except discord.ClientException:
-            return False
-
-    # =========================
     # Core playback loop
     # =========================
     async def player_loop(self, guild_id):
@@ -213,33 +176,38 @@ class Music(commands.Cog):
 
                 item = queue.pop(0)
 
-                vc = guild.voice_client
-                if not vc or not vc.is_connected():
+                player: wavelink.Player = guild.voice_client
+                if not player or not player.connected:
                     break
 
-                source = await YTDLSource.from_query(
+                tracks = await wavelink.Playable.search(
                     item["query"],
-                    loop=self.bot.loop
+                    source=wavelink.TrackSource.SoundCloud,
+                    node=wavelink.Pool.get_node()
                 )
 
+                if not tracks:
+                    continue
+
+                track = tracks[0]
+
                 embed = self.build_now_playing_embed(
-                    source,
+                    track,
                     item["requester"]
                 )
 
                 await self.cleanup_now_playing(guild_id)
 
-                text_channel = item["channel"]  # ✅ 요청 채널 사용
+                text_channel = item["channel"]
                 msg = await text_channel.send(
                     embed=embed,
-                    view=PlayerControls(vc)
+                    view=PlayerControls(player)
                 )
                 self.now_playing_message[guild_id] = msg
 
-                if not self.safe_play(vc, source):
-                    break
+                await player.play(track)
 
-                while vc.is_playing() or vc.is_paused():
+                while player.playing:
                     await asyncio.sleep(0.5)
 
         except asyncio.CancelledError:
@@ -261,12 +229,12 @@ class Music(commands.Cog):
             return
 
         if not ctx.voice_client:
-            await ctx.author.voice.channel.connect()
+            await ctx.author.voice.channel.connect(cls=wavelink.Player)
 
         self.get_queue(ctx.guild.id).append({
             "query": query,
             "requester": ctx.author,
-            "channel": ctx.channel   # ✅ 추가
+            "channel": ctx.channel
         })
 
         if ctx.guild.id not in self.play_tasks:
@@ -303,25 +271,17 @@ class Music(commands.Cog):
         except:
             pass
 
-        if not await self.ensure_author_in_voice(ctx):
+        player: wavelink.Player = ctx.voice_client
+        if not player:
             return
 
-        vc = ctx.voice_client
-        if not vc:
-            return
-
-        if vc.is_playing() or vc.is_paused():
-            vc.stop()
-
-        # 🗑 큐 초기화
+        await player.stop()
         self.get_queue(ctx.guild.id).clear()
 
-        # 재생 루프 종료
         task = self.play_tasks.pop(ctx.guild.id, None)
         if task:
             task.cancel()
 
-        # Now Playing 메시지 제거
         await self.cleanup_now_playing(ctx.guild.id)
 
     @commands.command()
@@ -334,10 +294,10 @@ class Music(commands.Cog):
         if not await self.ensure_author_in_voice(ctx):
             return
 
-        if ctx.voice_client and ctx.voice_client.is_connected():
-            return  # 이미 연결되어 있으면 아무것도 안 함
+        if ctx.voice_client and ctx.voice_client.connected:
+            return
 
-        await ctx.author.voice.channel.connect()
+        await ctx.author.voice.channel.connect(cls=wavelink.Player)
 
     @commands.command()
     async def leave(self, ctx):
@@ -346,15 +306,13 @@ class Music(commands.Cog):
         except:
             pass
 
-        vc = ctx.voice_client
-        if not vc:
+        player: wavelink.Player = ctx.voice_client
+        if not player:
             return
 
-        await vc.disconnect()
+        await player.disconnect()
 
-        # 큐 / 태스크 / 메시지 정리
         self.get_queue(ctx.guild.id).clear()
-
         task = self.play_tasks.pop(ctx.guild.id, None)
         if task:
             task.cancel()
@@ -380,7 +338,6 @@ class Music(commands.Cog):
 
         channels.add(channel_id)
         save_music_channels(channels)
-
         await ctx.send("전용채널로 추가되었습니다.", delete_after=5)
 
     @commands.command(name="채널삭제")
@@ -399,75 +356,7 @@ class Music(commands.Cog):
 
         channels.remove(channel_id)
         save_music_channels(channels)
-
         await ctx.send("전용채널에서 삭제되었습니다.", delete_after=5)
-
-    # =========================
-    # 도움말
-    # =========================
-    @commands.command(name="help", aliases=["도움말"])
-    async def help_command(self, ctx):
-        try:
-            await ctx.message.delete()
-        except:
-            pass
-
-        embed = discord.Embed(
-            title="🎶 음악봇 사용법",
-            description="이 봇은 음악 재생 전용 봇입니다.\n아래 명령어를 참고하세요.",
-            color=0x1DB954
-        )
-
-        embed.add_field(
-            name="▶️ 음악 재생",
-            value=(
-                "`!p <검색어 또는 URL>`\n"
-                "음악을 재생하거나 대기열에 추가합니다.\n"
-                "전용 채널에서는 `!` 없이 입력해도 자동 재생됩니다."
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="📜 재생목록",
-            value="`!q` 또는 `!queue`\n현재 대기 중인 음악 목록을 확인합니다.",
-            inline=False
-        )
-
-        embed.add_field(
-            name="⏹ 재생 제어",
-            value=(
-                "`!stop` : 재생 중지 + 대기열 초기화\n"
-                "⏯ 버튼 : 일시정지 / 재개\n"
-                "⏭ 버튼 : 현재 곡 스킵"
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="🔊 음성 채널",
-            value=(
-                "`!join` : 음성 채널 입장\n"
-                "`!leave` : 음성 채널 퇴장\n"
-                "※ 사람이 없으면 자동으로 퇴장합니다."
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="📌 전용 채널",
-            value=(
-                "`!채널추가` : 현재 채널을 음악 전용 채널로 설정\n"
-                "`!채널삭제` : 전용 채널 해제\n"
-                "전용 채널에서는 메시지가 자동 삭제됩니다."
-            ),
-            inline=False
-        )
-
-        embed.set_footer(text="🎧 즐거운 음악 감상 되세요!")
-
-        await ctx.send(embed=embed)
-
 
     # =========================
     # 전용채널 명령어
@@ -478,7 +367,6 @@ class Music(commands.Cog):
             return
 
         channels = load_music_channels()
-
         if message.channel.id not in channels:
             return
 
@@ -486,29 +374,20 @@ class Music(commands.Cog):
         if not content:
             return
 
-        # 전용 채널: 메시지 삭제
         try:
             await message.delete()
         except:
             pass
 
-        # !로 시작하면 기존 명령어에 맡김 (아무 것도 안 함)
         if content.startswith("!"):
             return
 
-        # ===== 여기부터 핵심 =====
-        # ! 없이 입력 → play(query) 직접 호출
-
         ctx = await self.bot.get_context(message)
-
-        # play command 객체 가져오기
         play_cmd = self.bot.get_command("p")
         if not play_cmd:
             return
 
-        # play(ctx, query=content) 실행
         await play_cmd.callback(self, ctx, query=content)
-
 
     # =========================
     # Auto leave
@@ -519,11 +398,11 @@ class Music(commands.Cog):
             return
 
         if before.channel and after.channel != before.channel:
-            vc = member.guild.voice_client
-            if vc and vc.channel == before.channel:
+            player: wavelink.Player = member.guild.voice_client
+            if player and player.channel == before.channel:
                 humans = [m for m in before.channel.members if not m.bot]
                 if not humans:
-                    await vc.disconnect()
+                    await player.disconnect()
                     self.get_queue(member.guild.id).clear()
 
                     task = self.play_tasks.pop(member.guild.id, None)
